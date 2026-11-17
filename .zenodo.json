@@ -1,0 +1,29 @@
+{
+  "title": "OpenFIR: High-Performance Multi-Path UDP Transport Protocol with Coprime-Stride Erasure Interleaving, Zero-Byte Content Teleportation, and Virtual Continuous Directory Extents",
+  "upload_type": "software",
+  "license": "Apache-2.0",
+  "creators": [
+    {
+      "name": "The OpenFIR Authors"
+    }
+  ],
+  "description": "Defensive publication and reference implementation of the OpenFIR (Open Fast Interleaved Reliable) UDP transport protocol. Key prior-art mechanisms disclosed in this work include: (1) Phi-Parity coprime-stride non-adjacent block interleaving combined with an in-memory belief-propagation peeling decoder and L1 chunk ring cache to recover from contiguous Gilbert-Elliott burst packet losses in O(1) XOR operations without waiting for NACK round-trip times; (2) In-flight content-addressed zero-byte teleportation (PKT_TELEPORT) using SHA-256 block digests, a reordering-resilient pending dependency queue, and a deadlock-free NACK fallback that forces raw data frame retransmission; (3) Zero-RTT Virtual Continuous Directory Extent (VirtualDirectoryExtent) that maps arbitrary nested directory trees and massive small files onto a single deterministic byte address space in memory with O(log N) binary-searched random-access ReadAt, micro-file chunk coalescing, and cross-file deduplication without temporary disk archives; (4) Kalman-filtered one-way delay gradient (KF-OWDG) congestion control with algebraic clock-offset cancellation driving a microsecond token-bucket pacer decoupled from random packet loss; and (5) Multi-path UDP 5-tuple socket striping with round-robin multi-endpoint feedback survivability and OFIRv1 printable ASCII header AAD-bound AES-256-GCM authenticated encryption.",
+  "keywords": [
+    "UDP transport protocol",
+    "high bandwidth-delay product",
+    "coprime stride interleaving",
+    "belief propagation peeling decoder",
+    "forward error correction",
+    "burst loss recovery",
+    "in-flight deduplication",
+    "content-addressed teleportation",
+    "virtual continuous extent",
+    "massive small files transfer",
+    "Kalman filter congestion control",
+    "one-way delay gradient",
+    "multi-path UDP striping",
+    "AES-256-GCM AEAD",
+    "defensive publication",
+    "prior art"
+  ]
+}
