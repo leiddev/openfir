@@ -1696,7 +1696,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			copy(dst, readAheadBuf[rel:rel+expLen])
 			return expLen, nil
 		}
-		n, err := readerAt.ReadAt(readAheadBuf, byteOff)
+		n, _ := readerAt.ReadAt(readAheadBuf, byteOff)
 		if n > 0 {
 			readAheadStart = byteOff
 			readAheadValid = int64(n)
