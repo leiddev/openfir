@@ -2205,7 +2205,6 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	var remoteFatalErr error
 	lastServerContact := time.Now()
 	lastProgressTime := time.Now()
-	lastFeedbackRecv := time.Now()
 
 	stopRecv := make(chan struct{})
 	var recvWG sync.WaitGroup
@@ -2286,7 +2285,6 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					now := time.Now()
 					handshakeDone = true
 					lastServerContact = now
-					lastFeedbackRecv = now
 
 					if rc > remoteRecvCount {
 						remoteRecvCount = rc
