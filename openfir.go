@@ -58,19 +58,21 @@ const (
 	EntryTypeFile uint8 = 0x00 // Directory bundle regular file entry
 	EntryTypeDir  uint8 = 0x01 // Directory bundle explicit subdirectory entry
 
-	DefaultChunkSize      = 1200             // Safe UDP payload size across WANs and tunnels
-	MaxUDPPacketSize      = 1500             // Maximum UDP datagram buffer size
-	SocketBufferBytes     = 16 * 1024 * 1024 // 16 MB kernel socket buffer target
-	PhiWindowSize         = 20               // Sliding window size for coprime interleaving
-	PhiStride             = 5                // Coprime stride (5 * 4 = 20); absorbs 5-packet burst losses
-	PhiGroupMembers       = 4                // Data chunks per algebraic parity equation
-	MaxPendingParity      = 512              // Maximum active equations in peeling decoder graph
-	MaxNackPerPacket      = 160              // Maximum NACK chunk IDs per feedback frame
-	MaxTrackedPeers       = 16               // Maximum concurrent client UDP paths tracked per session
-	L1ChunkCacheSize      = 512              // Receiver in-memory L1 ring cache slots
-	MaxTeleportIndexEntries = 500000         // Cap sender deduplication map to bound memory usage
-	CookieSize            = 16               // 128-bit stateless handshake cookie size
-	OuterHeaderSize       = 19               // [6B "OFIRv1"][1B Dir][8B Seq][4B RandSalt]
+	DefaultChunkSize        = 1200             // Safe UDP payload size across WANs and tunnels
+	MaxUDPPacketSize        = 1500             // Maximum UDP datagram buffer size
+	SocketBufferBytes       = 16 * 1024 * 1024 // 16 MB kernel socket buffer target
+	PhiWindowSize           = 20               // Sliding window size for coprime interleaving
+	PhiStride               = 5                // Coprime stride (5 * 4 = 20); absorbs 5-packet burst losses
+	PhiGroupMembers         = 4                // Data chunks per algebraic parity equation
+	MaxPendingParity        = 512              // Maximum active equations in peeling decoder graph
+	MaxNackPerPacket        = 160              // Maximum NACK chunk IDs per feedback frame
+	MaxTrackedPeers         = 16               // Maximum concurrent client UDP paths tracked per session
+	L1ChunkCacheSize        = 512              // Receiver in-memory L1 ring cache slots
+	MaxTeleportIndexEntries = 500000           // Cap sender deduplication map to bound memory usage
+	CookieSize              = 16               // 128-bit stateless handshake cookie size
+	OuterHeaderSize         = 19               // [6B "OFIRv1"][1B Dir][8B Seq][4B RandSalt]
+	ReplayWindowWords       = 128              // 128 * 64 = 8192-packet sliding anti-replay window
+	ReplayWindowBits        = ReplayWindowWords * 64
 )
 
 var (
@@ -173,9 +175,9 @@ func parseSecretMaterial(raw string) ([32]byte, bool, error) {
 }
 
 type WireCryptoEngine struct {
-	c2sAEAD    cipher.AEAD
-	s2cAEAD    cipher.AEAD
-	saltSeed   uint64
+	c2sAEAD  cipher.AEAD
+	s2cAEAD  cipher.AEAD
+	saltSeed uint64
 }
 
 func NewWireCryptoEngine(masterKey [32]byte) (*WireCryptoEngine, error) {
@@ -209,8 +211,6 @@ func NewWireCryptoEngine(masterKey [32]byte) (*WireCryptoEngine, error) {
 
 // Seal encapsulates an inner frame into an authenticated wire datagram:
 // [6B "OFIRv1"][1B Direction][8B Seq][4B CSPRNG-Salt][AES-256-GCM Ciphertext + 16B Tag]
-// The entire 19-byte outer header is bound as GCM Additional Authenticated Data (AAD),
-// and the 12-byte GCM Nonce is [8B Seq][4B CSPRNG-Salt] under direction-separated keys.
 func (w *WireCryptoEngine) Seal(raw []byte, direction uint8, seq uint64) []byte {
 	var aead cipher.AEAD
 	if direction == DirClientToServer {
@@ -228,8 +228,8 @@ func (w *WireCryptoEngine) Seal(raw []byte, direction uint8, seq uint64) []byte 
 	binary.BigEndian.PutUint64(out[7:15], seq)
 	binary.BigEndian.PutUint32(out[15:19], randSalt32)
 
-	nonce := out[7:19] // 12 bytes: [8B Seq][4B RandSalt32]
-	aad := out[0:19]   // 19 bytes: ["OFIRv1" || Direction || Seq || RandSalt32]
+	nonce := out[7:19]
+	aad := out[0:19]
 	out = aead.Seal(out, nonce, raw, aad)
 	return out
 }
@@ -270,12 +270,12 @@ func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, u
 	return raw, seq, true
 }
 
-// ReplayWindow implements a 128-packet sliding anti-replay window.
+// ReplayWindow implements an 8192-packet ring-buffer sliding anti-replay window,
+// tolerating multi-socket and multi-core reordering while blocking replays in O(1).
 type ReplayWindow struct {
 	mu      sync.Mutex
 	highest uint64
-	bitmap0 uint64 // [highest-63 .. highest]
-	bitmap1 uint64 // [highest-127 .. highest-64]
+	ring    [ReplayWindowWords]uint64
 	init    bool
 }
 
@@ -286,46 +286,44 @@ func (rw *ReplayWindow) CheckAndAccept(seq uint64) bool {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
+	wordIdx := (seq >> 6) % ReplayWindowWords
+	bitMask := uint64(1) << (seq & 63)
+
 	if !rw.init {
 		rw.init = true
 		rw.highest = seq
-		rw.bitmap0 = 1
+		rw.ring[wordIdx] = bitMask
 		return true
 	}
 
 	if seq > rw.highest {
-		shift := seq - rw.highest
-		if shift >= 128 {
-			rw.bitmap1 = 0
-			rw.bitmap0 = 1
-		} else if shift >= 64 {
-			rw.bitmap1 = rw.bitmap0 << (shift - 64)
-			rw.bitmap0 = 1
-		} else {
-			rw.bitmap1 = (rw.bitmap1 << shift) | (rw.bitmap0 >> (64 - shift))
-			rw.bitmap0 = (rw.bitmap0 << shift) | 1
+		oldWord := rw.highest >> 6
+		newWord := seq >> 6
+		if newWord > oldWord {
+			diffWords := newWord - oldWord
+			if diffWords >= ReplayWindowWords {
+				for i := 0; i < ReplayWindowWords; i++ {
+					rw.ring[i] = 0
+				}
+			} else {
+				for w := oldWord + 1; w <= newWord; w++ {
+					rw.ring[w%ReplayWindowWords] = 0
+				}
+			}
 		}
+		rw.ring[wordIdx] |= bitMask
 		rw.highest = seq
 		return true
 	}
 
 	diff := rw.highest - seq
-	if diff >= 128 {
+	if diff >= ReplayWindowBits-64 {
 		return false
 	}
-	if diff < 64 {
-		mask := uint64(1) << diff
-		if (rw.bitmap0 & mask) != 0 {
-			return false
-		}
-		rw.bitmap0 |= mask
-		return true
-	}
-	mask := uint64(1) << (diff - 64)
-	if (rw.bitmap1 & mask) != 0 {
+	if (rw.ring[wordIdx] & bitMask) != 0 {
 		return false
 	}
-	rw.bitmap1 |= mask
+	rw.ring[wordIdx] |= bitMask
 	return true
 }
 
@@ -1130,7 +1128,7 @@ func NewOpenFIRServer(cfg ServerConfig) (*OpenFIRServer, error) {
 	_, _ = rand.Read(cookieSeed[:])
 
 	if cfg.MaxFileSize <= 0 {
-		cfg.MaxFileSize = 64 * 1024 * 1024 * 1024 // 64 GB default cap
+		cfg.MaxFileSize = 64 * 1024 * 1024 * 1024
 	}
 	if cfg.MaxSessions <= 0 {
 		cfg.MaxSessions = 64
@@ -1198,14 +1196,19 @@ func (s *OpenFIRServer) sendError(tid uint64, code uint8, msg string, peer *net.
 	s.sendCloaked(pkt, peer)
 }
 
-// computeStatelessCookie binds client IP, port, TxID, and a 30-second time window.
+// computeStatelessCookie binds client IP, TxID, and a 30-second time window
+// (allowing multi-socket striping across ephemeral ports on the same client IP).
 func (s *OpenFIRServer) computeStatelessCookie(peer *net.UDPAddr, tid uint64, slot int64) [CookieSize]byte {
 	mac := hmac.New(sha256.New, s.cookieSecret[:])
-	mac.Write(peer.IP)
-	var b [18]byte
-	binary.BigEndian.PutUint16(b[0:2], uint16(peer.Port))
-	binary.BigEndian.PutUint64(b[2:10], tid)
-	binary.BigEndian.PutUint64(b[10:18], uint64(slot))
+	ip16 := peer.IP.To16()
+	if ip16 != nil {
+		mac.Write(ip16)
+	} else {
+		mac.Write(peer.IP)
+	}
+	var b [16]byte
+	binary.BigEndian.PutUint64(b[0:8], tid)
+	binary.BigEndian.PutUint64(b[8:16], uint64(slot))
 	mac.Write(b[:])
 	sum := mac.Sum(nil)
 	var out [CookieSize]byte
@@ -1267,7 +1270,6 @@ func (s *OpenFIRServer) Serve(targetCompletions int) error {
 	var completeOnce sync.Once
 	completedChan := make(chan struct{})
 
-	// Periodic feedback & session janitor loop
 	feedbackDone := make(chan struct{})
 	defer close(feedbackDone)
 	go func() {
@@ -1316,7 +1318,12 @@ func (s *OpenFIRServer) Serve(targetCompletions int) error {
 
 	checkTargetReached := func() {
 		if targetCompletions > 0 && int(atomic.LoadInt32(&s.completedCount)) >= targetCompletions {
-			completeOnce.Do(func() { close(completedChan) })
+			completeOnce.Do(func() {
+				go func() {
+					time.Sleep(25 * time.Millisecond)
+					close(completedChan)
+				}()
+			})
 		}
 	}
 
@@ -1438,8 +1445,6 @@ func (s *OpenFIRServer) Serve(targetCompletions int) error {
 }
 
 func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr) (*ReceiverSession, bool) {
-	// Payload after [3B hdr + 8B TxID]:
-	// [16B Cookie][8B FileSize][4B ChunkSize][4B TotalChunks][32B SHA256][1B Flags][2B NameLen][NameBytes]
 	if len(p) < 67 {
 		return nil, false
 	}
@@ -1463,7 +1468,6 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 		return nil, false
 	}
 
-	// Strict handshake geometry & resource limits validation
 	if chunkSize != DefaultChunkSize {
 		s.sendError(tid, 1, fmt.Sprintf("unsupported chunk size %d (expected %d)", chunkSize, DefaultChunkSize), peer)
 		return nil, false
@@ -1485,7 +1489,6 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 		return nil, false
 	}
 
-	// Verify stateless HMAC cookie to prevent spoofed-IP reflection & resource exhaustion
 	if !s.verifyStatelessCookie(peer, tid, cookie) {
 		nowSlot := time.Now().Unix() / 30
 		newCookie := s.computeStatelessCookie(peer, tid, nowSlot)
@@ -1517,7 +1520,6 @@ func (s *OpenFIRServer) handleHandshake(tid uint64, p []byte, peer *net.UDPAddr)
 			}
 		}
 
-		// Both single files and directory bundles stream into an atomic staging file first
 		stagingPath := filepath.Join(s.outputDir, fmt.Sprintf(".%s.openfir-part-%x", fileName, tid))
 		f, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 		if err != nil {
@@ -1665,8 +1667,6 @@ func (s *OpenFIRServer) handlePhiParity(sess *ReceiverSession, p []byte) {
 	sess.processOrEnqueueEquation(eq)
 }
 
-// commitChunkIterative uses an explicit breadth-first work queue to materialize
-// dependent teleports and peeled parity equations in O(1) stack space.
 func (sess *ReceiverSession) commitChunkIterative(initialIdx uint32, initialData []byte, initialSource string) {
 	queue := []commitWorkItem{{idx: initialIdx, data: initialData, source: initialSource}}
 	tmpBuf := make([]byte, sess.chunkSize)
@@ -1868,7 +1868,6 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 
 	gradUs, queueUs := sess.kalman.Snapshot()
 
-	// Layout: [Magic 2B][Type 1B][8B TxID][4B HighestContig][4B ScanLimit][4B RecvCount][8B GradUs][8B QueueUs][2B NackCnt][N*4B Nacks]
 	pkt := make([]byte, 41+len(nacks)*4)
 	pkt[0] = ProtocolMagic0
 	pkt[1] = ProtocolMagic1
@@ -1889,8 +1888,6 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 	s.sendCloaked(pkt, peer)
 }
 
-// checkAndFinalize performs full-file SHA-256 verification and atomic rename
-// OUTSIDE the session mutex so concurrent workers are never blocked.
 func (sess *ReceiverSession) checkAndFinalize(s *OpenFIRServer, fallbackPeer *net.UDPAddr) bool {
 	sess.mu.Lock()
 	if sess.receivedCount < sess.totalChunks {
@@ -1912,7 +1909,6 @@ func (sess *ReceiverSession) checkAndFinalize(s *OpenFIRServer, fallbackPeer *ne
 	f := sess.file
 	sess.mu.Unlock()
 
-	// Heavy I/O & SHA-256 verification executed outside sess.mu lock
 	_ = f.Sync()
 	_, _ = f.Seek(0, io.SeekStart)
 	h := sha256.New()
@@ -2195,6 +2191,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	var highestContig uint32
 	retransmitQueue := make([]uint32, 0, 1024)
 	var serverCookie [CookieSize]byte
+	cookieReady := make(chan struct{}, 1)
 	handshakeDone := false
 	transferFinAcked := false
 	remoteVerified := false
@@ -2243,6 +2240,10 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 						copy(serverCookie[:], p[:CookieSize])
 						lastServerContact = time.Now()
 						stateMu.Unlock()
+						select {
+						case cookieReady <- struct{}{}:
+						default:
+						}
 					}
 
 				case PktHandshakeAck:
@@ -2287,7 +2288,6 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 						lastProgressTime = now
 					}
 
-					// Parse explicit NACKs and infer SACKs within [hc, scanLimit)
 					nackSet := make(map[uint32]struct{}, nackCount)
 					offset := 30
 					for i := 0; i < nackCount && offset+4 <= len(p); i++ {
@@ -2357,7 +2357,12 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 		}
 		hsPkt := buildHandshakePacket(transferID, cookieCopy, totalSize, chunkSize, totalChunks, streamSHA256, flags, baseName)
 		c.sendCloaked(hsPkt)
-		time.Sleep(40 * time.Millisecond)
+
+		select {
+		case <-cookieReady:
+			// Immediately re-send handshake with echoed server cookie
+		case <-time.After(35 * time.Millisecond):
+		}
 	}
 
 	stateMu.Lock()
@@ -2677,10 +2682,6 @@ func buildPhiParityPacket(tid uint64, members []uint32, xorPayload []byte) []byt
 
 // ============================================================================
 // Module 8: Automated Chaos Self-Test Engine (-mode selftest)
-// Validates:
-//   Suite 1: 16 MB mixed-entropy single file under Gilbert-Elliott burst loss
-//   Suite 2: 200 small files + empty subdirectories via Zero-RTT Virtual Extent
-//   Suite 3: Concurrent multi-client transfers isolation regression test
 // ============================================================================
 
 func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
@@ -2996,7 +2997,7 @@ func main() {
 	case "selftest":
 		loss := *simLoss
 		if loss <= 0 {
-			loss = 0.08 // Default to 8% burst loss in selftest mode when unspecified
+			loss = 0.08
 		}
 		if err := runSelfTest(loss, *simBurst, *numSockets); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] Self-test failed: %v\n", err)
