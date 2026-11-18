@@ -34,9 +34,9 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 * **Clock-Offset Cancellation:** Constant clock offsets between sender and receiver cancel out algebraically without requiring NTP synchronization.
 * **1D Kalman Noise Filtering:** A scalar Kalman filter separates OS scheduling jitter from true bottleneck queue buildup, driving a microsecond-resolution token-bucket pacer that keeps bottleneck router queues shallow while fully saturating available link capacity.
 
-### 5. Hardened Wire Security, Stateless Cookie Handshake & Multi-Path Striping
+### 5. Polymorphic Printable-ASCII Wire Security, Stateless Cookie Handshake & Multi-Path Striping
+* **Per-Packet Polymorphic Printable-ASCII Header (`0x21..0x7E`):** Every datagram begins with 6 per-packet polymorphic printable ASCII characters (`wire[0:6]`), where `wire[5]` embeds an `HKDF-SHA256` keyed authentication tag and directional parity bit ($47 \times 2 = 94$), followed by a key-masked sequence number (`wire[6:14]`) and a 32-bit CSPRNG salt (`wire[14:18]`). The entire 18-byte outer header is bound as `AES-256-GCM` Additional Authenticated Data (`AAD`) and protected by an 8192-packet sliding anti-replay window.
 * **Stateless HMAC Cookie Challenge (`PKT_COOKIE_CHALLENGE`):** Prevents spoofed-IP UDP reflection and unauthenticated resource allocation by requiring clients to echo a time-bound stateless HMAC-SHA256 cookie before any session or staging file is created.
-* **RFC 5869 `HKDF-SHA256` & Directional `AES-256-GCM`:** Derives direction-separated 256-bit `AES-256-GCM` keys (`C2S` and `S2C`). Every datagram begins with a 19-byte outer header (`"OFIRv1" || Direction || Seq || CSPRNG-Salt32`) bound as GCM Additional Authenticated Data (`AAD`), backed by a 128-packet sliding anti-replay window.
 * **Atomic Staging & Multi-Session Isolation:** All transfers stream into isolated `.openfir-part-<txid>` staging files and atomically `os.Rename` into place only after out-of-lock `fsync` and full `SHA-256` verification succeed.
 
 ---
@@ -60,7 +60,7 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 |     [PKT_PHI_PARITY] -------------> [Micro-Burst Token-Bucket Pacer]              |
 |                                                |            ^                     |
 |                                                v            | (Kalman OWDG)       |
-|                         [HKDF + OFIRv1 Contextual AAD + AES-256-GCM Sealer]       |
+|                   [Polymorphic ASCII AAD + MaskedSeq + AES-256-GCM Sealer]        |
 |                                                |                                  |
 |                                                v                                  |
 |                            [Multi-Path UDP Socket Striping Pool (1..N)]           |
@@ -87,15 +87,15 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 
 ## Wire Frame Specification
 
-All frames are encapsulated inside an authenticated outer AEAD envelope (35 bytes total overhead):
+All frames are encapsulated inside an authenticated outer AEAD envelope (34 bytes total overhead):
 
 ```text
-+----------------+-----------+-------------+------------------+-------------------------+
-| ASCII Hdr (6B) | Dir (1B)  |  Seq (8B)   | CSPRNG Salt (4B) | AES-256-GCM Cipher+Tag  |
-|    "OFIRv1"    | 0x00/0x01 |  Monotonic  |  crypto/rand 32  | (Inner Frame + 16B Tag) |
-+----------------+-----------+-------------+------------------+-------------------------+
-|<--------------------- 19-Byte GCM AAD --------------------->|
-                             |<---- 12-Byte AES-GCM Nonce --->|
++------------------------------+-------------------+------------------+-------------------------+
+| Polymorphic ASCII Hdr (6B)   |  Masked Seq (8B)  | CSPRNG Salt (4B) | AES-256-GCM Cipher+Tag  |
+| 5B [0x21..7E] + 1B KeyedTag  |  seq ^ HeaderMix  |  crypto/rand 32  | (Inner Frame + 16B Tag) |
++------------------------------+-------------------+------------------+-------------------------+
+|<------------------------------- 18-Byte GCM AAD ------------------->|
+                               |<-- 12-Byte Unmasked AES-GCM Nonce -->|
 ```
 
 Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame begins with an 11-byte routing header (`[0x4F, 0x46, FrameType, 8B TxID]`):
@@ -121,8 +121,8 @@ Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame 
 * **Go 1.20+** (Zero external library dependencies; uses only the Go standard library).
 
 ### 1. Run Built-In Chaos Self-Test (`selftest` mode)
-OpenFIR includes an integrated Gilbert-Elliott burst-loss chaos simulator that automatically validates **three** test suites under 8% burst packet loss:
-1. A 16 MB mixed-entropy large file transfer;
+OpenFIR includes an integrated Gilbert-Elliott burst-loss chaos simulator that automatically validates **three** test suites under 8% burst packet loss (plus oversized datagram resilience):
+1. Three consecutive 16 MB mixed-entropy large file transfers;
 2. A 200-file nested directory tree (including empty subdirectories) via Zero-RTT Virtual Extent;
 3. Concurrent multi-client transfers to a single server.
 
