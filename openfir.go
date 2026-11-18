@@ -59,7 +59,8 @@ const (
 	EntryTypeDir  uint8 = 0x01 // Directory bundle explicit subdirectory entry
 
 	DefaultChunkSize        = 1200             // Safe UDP payload size across WANs and tunnels
-	MaxUDPPacketSize        = 1500             // Maximum UDP datagram buffer size
+	MaxUDPPacketSize        = 1500             // Maximum valid OpenFIR protocol frame size
+	MaxUDPDatagramSize      = 65536            // Full 64 KB buffer to prevent Windows WSAEMSGSIZE
 	SocketBufferBytes       = 16 * 1024 * 1024 // 16 MB kernel socket buffer target
 	PhiWindowSize           = 20               // Sliding window size for coprime interleaving
 	PhiStride               = 5                // Coprime stride (5 * 4 = 20); absorbs 5-packet burst losses
@@ -82,7 +83,7 @@ var (
 	defaultDemoHex   = "a37f92c819e4b50d6b2e4a1c809f73e5d4c1b2a390817263544536271809abef"
 	packetBufferPool = sync.Pool{
 		New: func() any {
-			b := make([]byte, MaxUDPPacketSize+256)
+			b := make([]byte, MaxUDPDatagramSize)
 			return &b
 		},
 	}
@@ -244,7 +245,7 @@ func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, u
 		aead = w.s2cAEAD
 	}
 
-	if len(wire) < OuterHeaderSize+aead.Overhead()+3 {
+	if len(wire) < OuterHeaderSize+aead.Overhead()+3 || len(wire) > MaxUDPPacketSize+256 {
 		return nil, 0, false
 	}
 	for i := 0; i < 6; i++ {
@@ -1427,17 +1428,28 @@ func (s *OpenFIRServer) Serve(targetCompletions int) error {
 		recvNano := time.Now().UnixNano()
 		if err != nil {
 			packetBufferPool.Put(bufPtr)
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
 			select {
 			case <-s.doneChan:
 				return nil
 			case <-completedChan:
 				return nil
 			default:
-				return err
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			// Ignore per-datagram or transient socket errors (e.g., WSAEMSGSIZE on Windows)
+			// so an oversized or malformed external datagram can never kill the server.
+			continue
+		}
+
+		// Fast pre-filter: drop undersized or oversized datagrams immediately before queuing
+		if n < OuterHeaderSize+19 || n > MaxUDPPacketSize+256 {
+			packetBufferPool.Put(bufPtr)
+			continue
 		}
 
 		workQueue <- inboundDatagram{
@@ -2212,7 +2224,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 		recvWG.Add(1)
 		go func(conn *net.UDPConn) {
 			defer recvWG.Done()
-			buf := make([]byte, MaxUDPPacketSize+256)
+			buf := make([]byte, MaxUDPDatagramSize)
 			for {
 				select {
 				case <-stopRecv:
@@ -2222,6 +2234,9 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 				_ = conn.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
 				n, _, err := conn.ReadFromUDP(buf)
 				if err != nil {
+					continue
+				}
+				if n < OuterHeaderSize+19 || n > MaxUDPPacketSize+256 {
 					continue
 				}
 				raw, seq, ok := c.crypto.Open(buf[:n], DirServerToClient)
@@ -2586,7 +2601,6 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			now := time.Now()
 
 			stateMu.Lock()
-			// Always prioritize hc directly first, since hc is guaranteed missing on receiver
 			if !ackedBitmap.Get(hc) && now.Sub(lastRetxTime[hc]) >= 25*time.Millisecond {
 				lastRetxTime[hc] = now
 				batchTargets = append(batchTargets, hc)
@@ -2708,9 +2722,36 @@ func buildPhiParityPacket(tid uint64, members []uint32, xorPayload []byte) []byt
 // Module 8: Automated Chaos Self-Test Engine (-mode selftest)
 // ============================================================================
 
+func sendOversizedUDPProbes(targetAddr string) error {
+	raddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		return err
+	}
+	laddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	probeConn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return err
+	}
+	defer probeConn.Close()
+	tuneUDPConn(probeConn)
+
+	// Send 1757-byte, 4000-byte, and 65000-byte oversized unauthenticated UDP datagrams
+	// to verify the server listener survives without triggering WSAEMSGSIZE on Windows.
+	for _, sz := range []int{1757, 4000, 65000} {
+		oversized := make([]byte, sz)
+		_, _ = rand.Read(oversized)
+		_, _ = probeConn.WriteToUDP(oversized, raddr)
+	}
+	time.Sleep(15 * time.Millisecond)
+	return nil
+}
+
 func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	fmt.Printf("====================================================================\n")
-	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.2.1)\n")
+	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.2.2)\n")
 	fmt.Printf("  Injected Channel Conditions: LossRate=%.1f%% | MeanBurstLength=%d | Sockets=%d\n",
 		lossRate*100, burstLen, numSockets)
 	fmt.Printf("====================================================================\n")
@@ -2726,7 +2767,7 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	outDir := filepath.Join(tmpDir, "received")
 
 	// ------------------------------------------------------------------------
-	// Suite 1: 16 MB Mixed-Entropy Single Large File (3 Consecutive Runs)
+	// Suite 1: 16 MB Mixed-Entropy Single Large File (3 Consecutive Runs + Oversized Probes)
 	// ------------------------------------------------------------------------
 	srcFile := filepath.Join(tmpDir, "test_payload.bin")
 	const totalTestBytes = 16 * 1024 * 1024
@@ -2761,6 +2802,11 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 		}
 		srv1Err := make(chan error, 1)
 		go func() { srv1Err <- srv1.Serve(1) }()
+
+		if err := sendOversizedUDPProbes(srv1.LocalAddr()); err != nil {
+			srv1.Close()
+			return err
+		}
 
 		chaos1 := NewChaosSimulator(lossRate, burstLen)
 		cli1, err := NewOpenFIRClient(ClientConfig{
@@ -3012,7 +3058,7 @@ func main() {
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Fprintf(os.Stderr, "OpenFIR v0.2.1 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
+		fmt.Fprintf(os.Stderr, "OpenFIR v0.2.2 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Run self-test : openfir -mode selftest\n")
 		fmt.Fprintf(os.Stderr, "  Start server  : openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret <64-hex-chars>\n")
@@ -3054,7 +3100,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Error] Failed to initialize server: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("[Server] OpenFIR v0.2.1 listening on %s (output dir: %s, overwrite: %v)\n",
+		fmt.Printf("[Server] OpenFIR v0.2.2 listening on %s (output dir: %s, overwrite: %v)\n",
 			srv.LocalAddr(), *outDir, *overwrite)
 		if err := srv.Serve(0); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] Server runtime error: %v\n", err)
