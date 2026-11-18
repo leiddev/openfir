@@ -66,6 +66,7 @@ const (
 	PhiGroupMembers         = 4                // Data chunks per algebraic parity equation
 	MaxPendingParity        = 512              // Maximum active equations in peeling decoder graph
 	MaxNackPerPacket        = 160              // Maximum NACK chunk IDs per feedback frame
+	FeedbackScanWindow      = 32768            // Receiver NACK/SACK scan horizon per feedback frame
 	MaxTrackedPeers         = 16               // Maximum concurrent client UDP paths tracked per session
 	L1ChunkCacheSize        = 512              // Receiver in-memory L1 ring cache slots
 	MaxTeleportIndexEntries = 500000           // Cap sender deduplication map to bound memory usage
@@ -270,8 +271,7 @@ func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, u
 	return raw, seq, true
 }
 
-// ReplayWindow implements an 8192-packet ring-buffer sliding anti-replay window,
-// tolerating multi-socket and multi-core reordering while blocking replays in O(1).
+// ReplayWindow implements an 8192-packet ring-buffer sliding anti-replay window.
 type ReplayWindow struct {
 	mu      sync.Mutex
 	highest uint64
@@ -356,6 +356,13 @@ func (b *CompactBitset) Set(idx uint32) {
 		return
 	}
 	b.words[idx>>6] |= (uint64(1) << (idx & 63))
+}
+
+func (b *CompactBitset) Clear(idx uint32) {
+	if idx >= b.size {
+		return
+	}
+	b.words[idx>>6] &^= (uint64(1) << (idx & 63))
 }
 
 // ============================================================================
@@ -1196,8 +1203,6 @@ func (s *OpenFIRServer) sendError(tid uint64, code uint8, msg string, peer *net.
 	s.sendCloaked(pkt, peer)
 }
 
-// computeStatelessCookie binds client IP, TxID, and a 30-second time window
-// (allowing multi-socket striping across ephemeral ports on the same client IP).
 func (s *OpenFIRServer) computeStatelessCookie(peer *net.UDPAddr, tid uint64, slot int64) [CookieSize]byte {
 	mac := hmac.New(sha256.New, s.cookieSecret[:])
 	ip16 := peer.IP.To16()
@@ -1854,8 +1859,8 @@ func (s *OpenFIRServer) sendFeedback(sess *ReceiverSession, peer *net.UDPAddr) {
 
 	var nacks []uint32
 	scanIdx := hc
-	maxScan := hc + 2048
-	if maxScan > total {
+	maxScan := hc + FeedbackScanWindow
+	if maxScan > total || maxScan < hc {
 		maxScan = total
 	}
 	for ; scanIdx < maxScan && len(nacks) < MaxNackPerPacket; scanIdx++ {
@@ -2188,7 +2193,9 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	var stateMu sync.Mutex
 	ackedBitmap := NewCompactBitset(totalChunks)
 	inRetransQueue := NewCompactBitset(totalChunks)
+	lastRetxTime := make(map[uint32]time.Time)
 	var highestContig uint32
+	var remoteRecvCount uint32
 	retransmitQueue := make([]uint32, 0, 1024)
 	var serverCookie [CookieSize]byte
 	cookieReady := make(chan struct{}, 1)
@@ -2268,6 +2275,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					}
 					hc := binary.BigEndian.Uint32(p[0:4])
 					scanLimit := binary.BigEndian.Uint32(p[4:8])
+					rc := binary.BigEndian.Uint32(p[8:12])
 					gradUs := int64(binary.BigEndian.Uint64(p[12:20]))
 					queueUs := int64(binary.BigEndian.Uint64(p[20:28]))
 					nackCount := int(binary.BigEndian.Uint16(p[28:30]))
@@ -2280,9 +2288,15 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 					lastServerContact = now
 					lastFeedbackRecv = now
 
+					if rc > remoteRecvCount {
+						remoteRecvCount = rc
+						lastProgressTime = now
+					}
+
 					if hc > highestContig && hc <= totalChunks {
 						for idx := highestContig; idx < hc; idx++ {
 							ackedBitmap.Set(idx)
+							delete(lastRetxTime, idx)
 						}
 						highestContig = hc
 						lastProgressTime = now
@@ -2295,8 +2309,10 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 						offset += 4
 						nackSet[nackIdx] = struct{}{}
 						if nackIdx < totalChunks && !ackedBitmap.Get(nackIdx) && !inRetransQueue.Get(nackIdx) {
-							inRetransQueue.Set(nackIdx)
-							retransmitQueue = append(retransmitQueue, nackIdx)
+							if now.Sub(lastRetxTime[nackIdx]) >= 20*time.Millisecond {
+								inRetransQueue.Set(nackIdx)
+								retransmitQueue = append(retransmitQueue, nackIdx)
+							}
 						}
 					}
 					if scanLimit > hc && scanLimit <= totalChunks {
@@ -2304,6 +2320,7 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 							if _, isMissing := nackSet[idx]; !isMissing {
 								if !ackedBitmap.Get(idx) {
 									ackedBitmap.Set(idx)
+									delete(lastRetxTime, idx)
 									lastProgressTime = now
 								}
 							}
@@ -2360,7 +2377,6 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 
 		select {
 		case <-cookieReady:
-			// Immediately re-send handshake with echoed server cookie
 		case <-time.After(35 * time.Millisecond):
 		}
 	}
@@ -2422,7 +2438,6 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 	}
 
 	var sweepCursor uint32 = 0
-	lastSweepTime := time.Now()
 	lastFinSendTime := time.Time{}
 	finBackoff := 15 * time.Millisecond
 	readBuf := make([]byte, chunkSize)
@@ -2436,12 +2451,15 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 		hc := highestContig
 		sinceContact := time.Since(lastServerContact)
 		sinceProgress := time.Since(lastProgressTime)
-		sinceFeedback := time.Since(lastFeedbackRecv)
 
 		var nackIdx uint32 = math.MaxUint32
 		if len(retransmitQueue) > 0 {
 			nackIdx = retransmitQueue[0]
 			retransmitQueue = retransmitQueue[1:]
+			inRetransQueue.Clear(nackIdx)
+			if !ackedBitmap.Get(nackIdx) && nackIdx >= hc {
+				lastRetxTime[nackIdx] = time.Now()
+			}
 		}
 		stateMu.Unlock()
 
@@ -2464,7 +2482,10 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 
 		// Priority 1: Service explicit NACK retransmissions (strictly using raw PktData)
 		if nackIdx != math.MaxUint32 {
-			if nackIdx >= hc && nackIdx < totalChunks {
+			stateMu.Lock()
+			alreadyAcked := ackedBitmap.Get(nackIdx)
+			stateMu.Unlock()
+			if !alreadyAcked && nackIdx >= hc && nackIdx < totalChunks {
 				expLen := expectedChunkLen(nackIdx, totalChunks, totalSize, chunkSize)
 				if err := readChunkExact(nackIdx, readBuf[:expLen], false); err != nil {
 					c.sendError(transferID, err.Error())
@@ -2561,40 +2582,45 @@ func (c *OpenFIRClient) SendFile(targetPath string) error {
 			}
 		}
 
-		// Priority 3: Paced tail recovery when feedback is silent, or FIN announcement
+		// Priority 3: Direct hc recovery & paced batch tail sweep, or FIN announcement
 		if hc < totalChunks {
-			if sinceFeedback < 45*time.Millisecond && time.Since(lastSweepTime) < 45*time.Millisecond {
-				time.Sleep(5 * time.Millisecond)
-				continue
+			var batchTargets []uint32
+			now := time.Now()
+
+			stateMu.Lock()
+			// Always prioritize hc directly first, since hc is guaranteed missing on receiver
+			if !ackedBitmap.Get(hc) && now.Sub(lastRetxTime[hc]) >= 25*time.Millisecond {
+				lastRetxTime[hc] = now
+				batchTargets = append(batchTargets, hc)
 			}
-			lastSweepTime = time.Now()
 
 			if sweepCursor < hc || sweepCursor >= totalChunks {
 				sweepCursor = hc
 			}
-			var targetIdx uint32 = math.MaxUint32
-			stateMu.Lock()
-			for scanned := uint32(0); scanned < totalChunks-hc; scanned++ {
-				cand := hc + ((sweepCursor - hc + scanned) % (totalChunks - hc))
-				if !ackedBitmap.Get(cand) {
-					targetIdx = cand
+			span := totalChunks - hc
+			for scanned := uint32(0); scanned < span && len(batchTargets) < 8; scanned++ {
+				cand := hc + ((sweepCursor - hc + scanned) % span)
+				if !ackedBitmap.Get(cand) && now.Sub(lastRetxTime[cand]) >= 25*time.Millisecond {
+					lastRetxTime[cand] = now
+					batchTargets = append(batchTargets, cand)
 					sweepCursor = cand + 1
-					break
 				}
 			}
 			stateMu.Unlock()
 
-			if targetIdx != math.MaxUint32 {
-				expLen := expectedChunkLen(targetIdx, totalChunks, totalSize, chunkSize)
-				if err := readChunkExact(targetIdx, readBuf[:expLen], false); err != nil {
-					c.sendError(transferID, err.Error())
-					return err
+			if len(batchTargets) > 0 {
+				for _, targetIdx := range batchTargets {
+					expLen := expectedChunkLen(targetIdx, totalChunks, totalSize, chunkSize)
+					if err := readChunkExact(targetIdx, readBuf[:expLen], false); err != nil {
+						c.sendError(transferID, err.Error())
+						return err
+					}
+					pkt := buildDataPacket(transferID, targetIdx, readBuf[:expLen])
+					c.pacer.Wait(len(pkt))
+					c.sendCloaked(pkt)
 				}
-				pkt := buildDataPacket(transferID, targetIdx, readBuf[:expLen])
-				c.pacer.Wait(len(pkt))
-				c.sendCloaked(pkt)
 			} else {
-				time.Sleep(5 * time.Millisecond)
+				time.Sleep(4 * time.Millisecond)
 			}
 		} else {
 			if time.Since(lastFinSendTime) >= finBackoff {
@@ -2686,7 +2712,7 @@ func buildPhiParityPacket(tid uint64, members []uint32, xorPayload []byte) []byt
 
 func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	fmt.Printf("====================================================================\n")
-	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.2.0)\n")
+	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.2.1)\n")
 	fmt.Printf("  Injected Channel Conditions: LossRate=%.1f%% | MeanBurstLength=%d | Sockets=%d\n",
 		lossRate*100, burstLen, numSockets)
 	fmt.Printf("====================================================================\n")
@@ -2702,9 +2728,8 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	outDir := filepath.Join(tmpDir, "received")
 
 	// ------------------------------------------------------------------------
-	// Suite 1: 16 MB Mixed-Entropy Single Large File
+	// Suite 1: 16 MB Mixed-Entropy Single Large File (3 Consecutive Runs)
 	// ------------------------------------------------------------------------
-	fmt.Printf("\n--- [Suite 1/3] Single Large File Transfer (16.00 MB) ---\n")
 	srcFile := filepath.Join(tmpDir, "test_payload.bin")
 	const totalTestBytes = 16 * 1024 * 1024
 	rawFileBytes := make([]byte, totalTestBytes)
@@ -2724,50 +2749,55 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 		return err
 	}
 
-	srv1, err := NewOpenFIRServer(ServerConfig{
-		ListenAddr:     "127.0.0.1:0",
-		OutputDir:      outDir,
-		MasterKey:      testMasterKey,
-		AllowOverwrite: true,
-	})
-	if err != nil {
-		return err
-	}
-	srv1Err := make(chan error, 1)
-	go func() { srv1Err <- srv1.Serve(1) }()
+	var totalDropped uint64
+	for iter := 1; iter <= 3; iter++ {
+		fmt.Printf("\n--- [Suite 1/3 - Iteration %d/3] Single Large File Transfer (16.00 MB) ---\n", iter)
+		srv1, err := NewOpenFIRServer(ServerConfig{
+			ListenAddr:     "127.0.0.1:0",
+			OutputDir:      outDir,
+			MasterKey:      testMasterKey,
+			AllowOverwrite: true,
+		})
+		if err != nil {
+			return err
+		}
+		srv1Err := make(chan error, 1)
+		go func() { srv1Err <- srv1.Serve(1) }()
 
-	chaos1 := NewChaosSimulator(lossRate, burstLen)
-	cli1, err := NewOpenFIRClient(ClientConfig{
-		ServerAddr: srv1.LocalAddr(),
-		MasterKey:  testMasterKey,
-		NumSockets: numSockets,
-		InitMBps:   80.0,
-		MaxMBps:    500.0,
-		Chaos:      chaos1,
-	})
-	if err != nil {
-		srv1.Close()
-		return err
-	}
-	if err := cli1.SendFile(srcFile); err != nil {
+		chaos1 := NewChaosSimulator(lossRate, burstLen)
+		cli1, err := NewOpenFIRClient(ClientConfig{
+			ServerAddr: srv1.LocalAddr(),
+			MasterKey:  testMasterKey,
+			NumSockets: numSockets,
+			InitMBps:   80.0,
+			MaxMBps:    500.0,
+			Chaos:      chaos1,
+		})
+		if err != nil {
+			srv1.Close()
+			return err
+		}
+		if err := cli1.SendFile(srcFile); err != nil {
+			cli1.Close()
+			srv1.Close()
+			return err
+		}
 		cli1.Close()
+		if err := <-srv1Err; err != nil {
+			srv1.Close()
+			return err
+		}
 		srv1.Close()
-		return err
-	}
-	cli1.Close()
-	if err := <-srv1Err; err != nil {
-		srv1.Close()
-		return err
-	}
-	srv1.Close()
+		totalDropped += chaos1.droppedCount
 
-	dstFile := filepath.Join(outDir, "test_payload.bin")
-	receivedBytes, err := os.ReadFile(dstFile)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(rawFileBytes, receivedBytes) {
-		return errors.New("suite 1 failure: received large file does not match source byte-for-byte")
+		dstFile := filepath.Join(outDir, "test_payload.bin")
+		receivedBytes, err := os.ReadFile(dstFile)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(rawFileBytes, receivedBytes) {
+			return fmt.Errorf("suite 1 iteration %d failure: received large file mismatch", iter)
+		}
 	}
 
 	// ------------------------------------------------------------------------
@@ -2847,6 +2877,7 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 		return err
 	}
 	srv2.Close()
+	totalDropped += chaos2.droppedCount
 
 	dstSmallDir := filepath.Join(outDir, "small_files_dataset")
 	if st, err := os.Stat(filepath.Join(dstSmallDir, "empty_nested_dir", "inner_empty")); err != nil || !st.IsDir() {
@@ -2956,8 +2987,7 @@ func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 		return errors.New("suite 3 failure: concurrent_B.bin corrupted")
 	}
 
-	totalDropped := chaos1.droppedCount + chaos2.droppedCount
-	fmt.Printf("\n[SelfTest] ALL 3 SUITES PASSED 100%%! (Total dropped packets recovered: %d)\n", totalDropped)
+	fmt.Printf("\n[SelfTest] ALL SUITES PASSED 100%%! (Total dropped packets recovered: %d)\n", totalDropped)
 	return nil
 }
 
@@ -2984,7 +3014,7 @@ func main() {
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Fprintf(os.Stderr, "OpenFIR v0.2.0 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
+		fmt.Fprintf(os.Stderr, "OpenFIR v0.2.1 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Run self-test : openfir -mode selftest\n")
 		fmt.Fprintf(os.Stderr, "  Start server  : openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret <64-hex-chars>\n")
@@ -3026,7 +3056,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Error] Failed to initialize server: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("[Server] OpenFIR v0.2.0 listening on %s (output dir: %s, overwrite: %v)\n",
+		fmt.Printf("[Server] OpenFIR v0.2.1 listening on %s (output dir: %s, overwrite: %v)\n",
 			srv.LocalAddr(), *outDir, *overwrite)
 		if err := srv.Serve(0); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] Server runtime error: %v\n", err)
