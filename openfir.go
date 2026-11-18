@@ -52,8 +52,8 @@ const (
 	FlagSingleFile      uint8 = 0x00 // Payload represents a single regular file
 	FlagDirectoryBundle uint8 = 0x01 // Payload represents a Virtual Continuous Directory Extent
 
-	DirClientToServer uint8 = 0x00 // Directional domain byte: Client -> Server
-	DirServerToClient uint8 = 0x01 // Directional domain byte: Server -> Client
+	DirClientToServer uint8 = 0x00 // Directional domain: Client -> Server (even ASCII parity)
+	DirServerToClient uint8 = 0x01 // Directional domain: Server -> Client (odd ASCII parity)
 
 	EntryTypeFile uint8 = 0x00 // Directory bundle regular file entry
 	EntryTypeDir  uint8 = 0x01 // Directory bundle explicit subdirectory entry
@@ -72,13 +72,12 @@ const (
 	L1ChunkCacheSize        = 512              // Receiver in-memory L1 ring cache slots
 	MaxTeleportIndexEntries = 500000           // Cap sender deduplication map to bound memory usage
 	CookieSize              = 16               // 128-bit stateless handshake cookie size
-	OuterHeaderSize         = 19               // [6B "OFIRv1"][1B Dir][8B Seq][4B RandSalt]
+	OuterHeaderSize         = 18               // [6B Polymorphic Printable ASCII][8B MaskedSeq][4B RandSalt]
 	ReplayWindowWords       = 128              // 128 * 64 = 8192-packet sliding anti-replay window
 	ReplayWindowBits        = ReplayWindowWords * 64
 )
 
 var (
-	wireHeaderPrefix = [6]byte{'O', 'F', 'I', 'R', 'v', '1'}
 	entryMagicBytes  = [4]byte{'O', 'F', 'E', 'N'}
 	defaultDemoHex   = "a37f92c819e4b50d6b2e4a1c809f73e5d4c1b2a390817263544536271809abef"
 	packetBufferPool = sync.Pool{
@@ -90,7 +89,7 @@ var (
 )
 
 // ============================================================================
-// Module 1: RFC 5869 HKDF-SHA256, Contextual AAD AES-256-GCM & Anti-Replay
+// Module 1: Polymorphic Printable-ASCII Header, HKDF-SHA256 & AES-256-GCM
 // ============================================================================
 
 func splitMix64Next(state *uint64) uint64 {
@@ -99,6 +98,15 @@ func splitMix64Next(state *uint64) uint64 {
 	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
 	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
 	return z ^ (z >> 31)
+}
+
+func keyedHeaderMix(hdrKey uint64, b []byte) uint64 {
+	var v uint64
+	for i := 0; i < len(b); i++ {
+		v = (v << 8) | uint64(b[i])
+	}
+	state := hdrKey ^ v
+	return splitMix64Next(&state)
 }
 
 func cryptoRandUint64() uint64 {
@@ -137,7 +145,6 @@ func hkdfSHA256(ikm, salt, info []byte) [32]byte {
 }
 
 // parseSecretMaterial validates and derives a 256-bit master key from user input.
-// Fails closed on malformed input rather than silently falling back.
 func parseSecretMaterial(raw string) ([32]byte, bool, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -179,12 +186,14 @@ func parseSecretMaterial(raw string) ([32]byte, bool, error) {
 type WireCryptoEngine struct {
 	c2sAEAD  cipher.AEAD
 	s2cAEAD  cipher.AEAD
+	hdrKey   uint64
 	saltSeed uint64
 }
 
 func NewWireCryptoEngine(masterKey [32]byte) (*WireCryptoEngine, error) {
 	c2sKey := hkdfSHA256(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v2-C2S-AEAD"))
 	s2cKey := hkdfSHA256(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v2-S2C-AEAD"))
+	hdrMaterial := hkdfSHA256(masterKey[:], []byte("OpenFIR-v2-Dir-Salt"), []byte("OpenFIR-v3-ASCII-Header-Key"))
 
 	b1, err := aes.NewCipher(c2sKey[:])
 	if err != nil {
@@ -207,12 +216,14 @@ func NewWireCryptoEngine(masterKey [32]byte) (*WireCryptoEngine, error) {
 	return &WireCryptoEngine{
 		c2sAEAD:  aead1,
 		s2cAEAD:  aead2,
+		hdrKey:   binary.BigEndian.Uint64(hdrMaterial[0:8]),
 		saltSeed: cryptoRandUint64(),
 	}, nil
 }
 
-// Seal encapsulates an inner frame into an authenticated wire datagram:
-// [6B "OFIRv1"][1B Direction][8B Seq][4B CSPRNG-Salt][AES-256-GCM Ciphertext + 16B Tag]
+// Seal encapsulates an inner frame into an authenticated wire datagram with a
+// per-packet polymorphic printable ASCII prefix (0x21..0x7E) and masked sequence number:
+// [6B Polymorphic Printable ASCII][8B Key-Masked Seq][4B CSPRNG-Salt][AES-256-GCM Ciphertext + 16B Tag]
 func (w *WireCryptoEngine) Seal(raw []byte, direction uint8, seq uint64) []byte {
 	var aead cipher.AEAD
 	if direction == DirClientToServer {
@@ -221,22 +232,32 @@ func (w *WireCryptoEngine) Seal(raw []byte, direction uint8, seq uint64) []byte 
 		aead = w.s2cAEAD
 	}
 
-	saltState := atomic.AddUint64(&w.saltSeed, 1) ^ seq
+	saltState := atomic.AddUint64(&w.saltSeed, 1) ^ seq ^ uint64(cryptoRandUint32())
+	pRand := splitMix64Next(&saltState)
 	randSalt32 := uint32(splitMix64Next(&saltState)) ^ cryptoRandUint32()
 
 	out := make([]byte, OuterHeaderSize, OuterHeaderSize+len(raw)+aead.Overhead())
-	copy(out[0:6], wireHeaderPrefix[:])
-	out[6] = direction
-	binary.BigEndian.PutUint64(out[7:15], seq)
-	binary.BigEndian.PutUint32(out[15:19], randSalt32)
+	for i := 0; i < 5; i++ {
+		out[i] = byte(0x21 + (pRand % 94))
+		pRand /= 94
+	}
+	tag47 := int(keyedHeaderMix(w.hdrKey, out[0:5]) % 47)
+	out[5] = byte(0x21 + tag47*2 + int(direction&1))
 
-	nonce := out[7:19]
-	aad := out[0:19]
-	out = aead.Seal(out, nonce, raw, aad)
+	seqMask := keyedHeaderMix(w.hdrKey^0x9e3779b97f4a7c15, out[0:6])
+	binary.BigEndian.PutUint64(out[6:14], seq^seqMask)
+	binary.BigEndian.PutUint32(out[14:18], randSalt32)
+
+	var nonce [12]byte
+	binary.BigEndian.PutUint64(nonce[0:8], seq)
+	binary.BigEndian.PutUint32(nonce[8:12], randSalt32)
+
+	aad := out[0:OuterHeaderSize]
+	out = aead.Seal(out, nonce[:], raw, aad)
 	return out
 }
 
-// Open verifies the 19-byte outer header, direction domain, and AES-256-GCM tag.
+// Open verifies the 6-byte polymorphic printable-ASCII header, direction parity, and AES-256-GCM tag.
 func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, uint64, bool) {
 	var aead cipher.AEAD
 	if expectedDirection == DirClientToServer {
@@ -249,20 +270,27 @@ func (w *WireCryptoEngine) Open(wire []byte, expectedDirection uint8) ([]byte, u
 		return nil, 0, false
 	}
 	for i := 0; i < 6; i++ {
-		if wire[i] != wireHeaderPrefix[i] {
+		if wire[i] < 0x21 || wire[i] > 0x7E {
 			return nil, 0, false
 		}
 	}
-	if wire[6] != expectedDirection {
+	tag47 := int(keyedHeaderMix(w.hdrKey, wire[0:5]) % 47)
+	expectedByte5 := byte(0x21 + tag47*2 + int(expectedDirection&1))
+	if wire[5] != expectedByte5 {
 		return nil, 0, false
 	}
 
-	seq := binary.BigEndian.Uint64(wire[7:15])
-	nonce := wire[7:19]
-	aad := wire[0:19]
-	ciphertext := wire[19:]
+	seqMask := keyedHeaderMix(w.hdrKey^0x9e3779b97f4a7c15, wire[0:6])
+	seq := binary.BigEndian.Uint64(wire[6:14]) ^ seqMask
 
-	raw, err := aead.Open(nil, nonce, ciphertext, aad)
+	var nonce [12]byte
+	binary.BigEndian.PutUint64(nonce[0:8], seq)
+	copy(nonce[8:12], wire[14:18])
+
+	aad := wire[0:OuterHeaderSize]
+	ciphertext := wire[OuterHeaderSize:]
+
+	raw, err := aead.Open(nil, nonce[:], ciphertext, aad)
 	if err != nil {
 		return nil, 0, false
 	}
@@ -1441,12 +1469,9 @@ func (s *OpenFIRServer) Serve(targetCompletions int) error {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			// Ignore per-datagram or transient socket errors (e.g., WSAEMSGSIZE on Windows)
-			// so an oversized or malformed external datagram can never kill the server.
 			continue
 		}
 
-		// Fast pre-filter: drop undersized or oversized datagrams immediately before queuing
 		if n < OuterHeaderSize+19 || n > MaxUDPPacketSize+256 {
 			packetBufferPool.Put(bufPtr)
 			continue
@@ -2738,8 +2763,6 @@ func sendOversizedUDPProbes(targetAddr string) error {
 	defer probeConn.Close()
 	tuneUDPConn(probeConn)
 
-	// Send 1757-byte, 4000-byte, and 65000-byte oversized unauthenticated UDP datagrams
-	// to verify the server listener survives without triggering WSAEMSGSIZE on Windows.
 	for _, sz := range []int{1757, 4000, 65000} {
 		oversized := make([]byte, sz)
 		_, _ = rand.Read(oversized)
@@ -2751,7 +2774,7 @@ func sendOversizedUDPProbes(targetAddr string) error {
 
 func runSelfTest(lossRate float64, burstLen int, numSockets int) error {
 	fmt.Printf("====================================================================\n")
-	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.2.2)\n")
+	fmt.Printf("  OpenFIR Automated Chaos Self-Test Engine (v0.3.0)\n")
 	fmt.Printf("  Injected Channel Conditions: LossRate=%.1f%% | MeanBurstLength=%d | Sockets=%d\n",
 		lossRate*100, burstLen, numSockets)
 	fmt.Printf("====================================================================\n")
@@ -3058,7 +3081,7 @@ func main() {
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Fprintf(os.Stderr, "OpenFIR v0.2.2 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
+		fmt.Fprintf(os.Stderr, "OpenFIR v0.3.0 — High-Performance Multi-Path UDP File & Directory Transfer Protocol\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Run self-test : openfir -mode selftest\n")
 		fmt.Fprintf(os.Stderr, "  Start server  : openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret <64-hex-chars>\n")
@@ -3100,7 +3123,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[Error] Failed to initialize server: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("[Server] OpenFIR v0.2.2 listening on %s (output dir: %s, overwrite: %v)\n",
+		fmt.Printf("[Server] OpenFIR v0.3.0 listening on %s (output dir: %s, overwrite: %v)\n",
 			srv.LocalAddr(), *outDir, *overwrite)
 		if err := srv.Serve(0); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] Server runtime error: %v\n", err)
