@@ -12,17 +12,17 @@ Engineered for high Bandwidth-Delay Product (BDP) wide-area networks, transconti
 ### 1. $\phi$-Parity Coprime-Stride Interleaving & Belief-Propagation Peeling Decoder
 Conventional Forward Error Correction (FEC) schemes group contiguous packets into block parity equations, which fail when network links experience Gilbert-Elliott contiguous burst losses.
 * **Coprime Stride Interleaving:** OpenFIR weaves GF(2) algebraic parity equations (`PKT_PHI_PARITY`) across non-adjacent chunks separated by a coprime stride $S$ within a sliding window $W$. Any contiguous burst loss of up to $S$ packets impacts at most **one** symbol per algebraic equation.
-* **Real-Time Peeling Decoder:** The receiver maintains an in-memory bipartite graph of pending parity equations backed by an L1 chunk ring cache. When an incoming data chunk or parity frame reduces an equation's unknown degree to $1$, the receiver immediately reconstructs the missing chunk via $O(1)$ XOR elimination and triggers a breadth-first cascade across dependent equations—healing lost packets locally without waiting for a NACK Round-Trip Time (RTT).
+* **Real-Time Iterative Peeling Decoder:** The receiver maintains an in-memory bipartite graph of pending parity equations backed by an L1 chunk ring cache. When an incoming data chunk or parity frame reduces an equation's unknown degree to $1$, the receiver immediately reconstructs the missing chunk via $O(1)$ XOR elimination and triggers an iterative breadth-first cascade across dependent equations—healing lost packets locally without waiting for a NACK Round-Trip Time (RTT).
 
 ### 2. In-Flight Content-Addressed Zero-Byte Teleportation (`PKT_TELEPORT`)
 Real-world datasets—such as virtual machine images, container layers, source trees, database snapshots, and uncompressed archives—contain substantial cross-region and cross-file block redundancy.
-* **Zero-Payload Cloning:** The sender computes cryptographic SHA-256 digests for outgoing chunks on the fly. When a chunk matches any previously transmitted chunk across the entire transfer session, the sender suppresses the 1200-byte payload and transmits a compact **19-byte `PKT_TELEPORT` instruction**.
+* **Zero-Payload Cloning:** The sender computes cryptographic SHA-256 digests for outgoing chunks on the fly. When a chunk matches any previously transmitted chunk across the transfer session, the sender suppresses the 1200-byte payload and transmits a compact **27-byte `PKT_TELEPORT` instruction**.
 * **Reordering-Resilient Local Materialization:** Upon receiving `PKT_TELEPORT(TargetIdx <- SourceIdx)`, the receiver clones the payload directly from its in-memory L1 chunk cache or local storage via `pread`/`pwrite`. If `PKT_TELEPORT` arrives ahead of `SourceIdx` due to UDP reordering, the instruction is queued in a dependency map and automatically materialized the instant `SourceIdx` is committed.
 * **Deadlock-Free NACK Fallback:** Any chunk requested via an explicit receiver NACK is strictly retransmitted as a raw `PKT_DATA` frame, guaranteeing 100% forward progress under arbitrary packet loss.
 
 ### 3. Zero-RTT Virtual Continuous Extent for Massive Small Files (`VirtualDirectoryExtent`)
 Transferring tens of thousands of small files individually over high-RTT links suffers from catastrophic per-file handshake latency and filesystem `fsync` storms.
-* **Tarless Zero-Temp-Disk Streaming:** When `-file` points to a directory, OpenFIR maps the entire directory tree in memory onto a **single deterministic Virtual Continuous Byte Extent** without writing any temporary archive to the sender's disk.
+* **Tarless Zero-Temp-Disk Streaming:** When `-file` points to a directory, OpenFIR maps the entire directory tree (including empty subdirectories) in memory onto a **single deterministic Virtual Continuous Byte Extent** without writing any temporary archive to the sender's disk.
 * **O(log N) Random-Access Retransmission:** File boundaries are indexed in an interval array. Arbitrary chunk reads and out-of-order NACK retransmissions resolve the underlying small file slices in $O(\log N)$ time via binary search.
 * **Micro-File Coalescing & Cross-File Deduplication:** Multiple tiny files are automatically coalesced into single 1200-byte UDP frames, while $\phi$-Parity equations and `PKT_TELEPORT` deduplication operate seamlessly across file boundaries.
 
@@ -34,10 +34,10 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 * **Clock-Offset Cancellation:** Constant clock offsets between sender and receiver cancel out algebraically without requiring NTP synchronization.
 * **1D Kalman Noise Filtering:** A scalar Kalman filter separates OS scheduling jitter from true bottleneck queue buildup, driving a microsecond-resolution token-bucket pacer that keeps bottleneck router queues shallow while fully saturating available link capacity.
 
-### 5. Multi-Path UDP Socket Striping & Multi-Core AEAD Pipeline
-* **Concurrent Source-Port Striping:** The OpenFIR client opens a configurable pool of $N$ independent local UDP sockets (default `8`) and stripes outgoing datagrams round-robin across all $N$ 5-tuples, keeping per-flow rates below carrier anti-DDoS policing thresholds.
-* **Multi-Path Feedback Survivability:** The receiver dynamically tracks all active client endpoints per session and rotates `PKT_FEEDBACK` frames across all observed paths.
-* **`OFIRv1` AAD-Bound `AES-256-GCM` Security:** Every datagram begins with a 6-byte printable ASCII protocol header (`OFIRv1`) bound as Additional Authenticated Data (AAD), followed by a bijectively whitened 96-bit nonce and an `AES-256-GCM` encrypted payload processed across a multi-core worker pool.
+### 5. Hardened Wire Security, Stateless Cookie Handshake & Multi-Path Striping
+* **Stateless HMAC Cookie Challenge (`PKT_COOKIE_CHALLENGE`):** Prevents spoofed-IP UDP reflection and unauthenticated resource allocation by requiring clients to echo a time-bound stateless HMAC-SHA256 cookie before any session or staging file is created.
+* **RFC 5869 `HKDF-SHA256` & Directional `AES-256-GCM`:** Derives direction-separated 256-bit `AES-256-GCM` keys (`C2S` and `S2C`). Every datagram begins with a 19-byte outer header (`"OFIRv1" || Direction || Seq || CSPRNG-Salt32`) bound as GCM Additional Authenticated Data (`AAD`), backed by a 128-packet sliding anti-replay window.
+* **Atomic Staging & Multi-Session Isolation:** All transfers stream into isolated `.openfir-part-<txid>` staging files and atomically `os.Rename` into place only after out-of-lock `fsync` and full `SHA-256` verification succeed.
 
 ---
 
@@ -60,18 +60,18 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 |     [PKT_PHI_PARITY] -------------> [Micro-Burst Token-Bucket Pacer]              |
 |                                                |            ^                     |
 |                                                v            | (Kalman OWDG)       |
-|                               [OFIRv1 AAD + AES-256-GCM Sealer]                   |
+|                         [HKDF + OFIRv1 Contextual AAD + AES-256-GCM Sealer]       |
 |                                                |                                  |
 |                                                v                                  |
 |                            [Multi-Path UDP Socket Striping Pool (1..N)]           |
 +------------------------------------------------|------------+---------------------+
                                                  |            |
                             Multi-5-Tuple UDP    |            | PKT_FEEDBACK
-                          (High-BDP / Lossy WAN) v            | (Rotated Paths)
+                          (High-BDP / Lossy WAN) v            | (SACK + NACK + OWDG)
 +------------------------------------------------|------------+---------------------+
 |                                 OpenFIR RECEIVER            |                     |
 |                                                             |                     |
-|                            [Multi-Core AES-256-GCM Worker Pool]                   |
+|                     [Multi-Core AES-256-GCM + Anti-Replay Worker Pool]            |
 |                                     /          |             \                    |
 |                      (PKT_PHI_PARITY)      (PKT_DATA)   (PKT_TELEPORT)            |
 |                            /                   |                 \                |
@@ -79,7 +79,7 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 |            [Peeling Decoder Graph] ===> [Commit + L1 Cache] <=== [Teleport Queue] |
 |                                                |                                  |
 |                                                v                                  |
-|                         [Out-of-Order pwrite + SHA-256 + Dir Unpacker]            |
+|                      [Atomic .openfir-part Staging + SHA-256 + Rename]            |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -87,28 +87,31 @@ $$\Delta d_k = (T_{\text{recv},k} - T_{\text{recv},k-1}) - (T_{\text{send},k} - 
 
 ## Wire Frame Specification
 
-All frames are encapsulated inside an authenticated outer AEAD envelope (34 bytes total overhead):
+All frames are encapsulated inside an authenticated outer AEAD envelope (35 bytes total overhead):
 
 ```text
-+-----------------------+--------------------------+--------------------------------+
-|  ASCII Header (6B)    |   Whitened Nonce (12B)   |  AES-256-GCM Ciphertext + Tag  |
-|      "OFIRv1"         |  Bijective SplitMix96    |  (Inner Frame + 16B GMAC Tag)  |
-+-----------------------+--------------------------+--------------------------------+
-|<--- GCM AAD Bound --->|
++----------------+-----------+-------------+------------------+-------------------------+
+| ASCII Hdr (6B) | Dir (1B)  |  Seq (8B)   | CSPRNG Salt (4B) | AES-256-GCM Cipher+Tag  |
+|    "OFIRv1"    | 0x00/0x01 |  Monotonic  |  crypto/rand 32  | (Inner Frame + 16B Tag) |
++----------------+-----------+-------------+------------------+-------------------------+
+|<--------------------- 19-Byte GCM AAD --------------------->|
+                             |<---- 12-Byte AES-GCM Nonce --->|
 ```
 
-Once decrypted and authenticated via `AES-256-GCM`, the inner plaintext frame begins with a 3-byte header (`[0x4F, 0x46, FrameType]`):
+Once decrypted and authenticated via `AES-256-GCM`, every inner plaintext frame begins with an 11-byte routing header (`[0x4F, 0x46, FrameType, 8B TxID]`):
 
-| `FrameType` | Name | Inner Payload Layout | Description |
+| `FrameType` | Name | Inner Payload Layout (after `3B Hdr + 8B TxID`) | Description |
 | :--- | :--- | :--- | :--- |
-| `0x01` | `PKT_HANDSHAKE` | `[8B TxID][8B Size][4B ChunkSz][4B Chunks][32B SHA256][1B Flags][2B NameLen][Name]` | Session initialization (`Flags=0x01` indicates directory bundle) |
-| `0x02` | `PKT_HANDSHAKE_ACK` | `[8B TxID][4B HighestContiguous]` | Idempotent session readiness confirmation |
+| `0x01` | `PKT_HANDSHAKE` | `[16B Cookie][8B Size][4B ChunkSz][4B Chunks][32B SHA256][1B Flags][2B NameLen][Name]` | Session initialization (`Flags=0x01` indicates directory bundle) |
+| `0x02` | `PKT_HANDSHAKE_ACK` | `[4B HighestContiguous]` | Session readiness confirmation & resume offset |
 | `0x03` | `PKT_DATA` | `[4B ChunkIdx][8B SendTimestampNano][2B DataLen][Payload]` | Standard data payload frame |
 | `0x04` | `PKT_TELEPORT` | `[4B TargetIdx][4B SourceIdx][8B SendTimestampNano]` | Zero-byte content-addressed local clone instruction |
 | `0x05` | `PKT_PHI_PARITY` | `[1B MemberCount][N*4B MemberIndices][2B ParityLen][XORPayload]` | Coprime-stride interleaved GF(2) erasure recovery frame |
-| `0x06` | `PKT_FEEDBACK` | `[8B TxID][4B HighestContig][4B RecvCount][8B GradUs][8B QueueUs][2B NackCnt][N*4B Nacks]` | Selective repeat NACK bitmap + Kalman OWD gradient telemetry |
-| `0x07` | `PKT_FIN` | `[8B TxID]` | Sender completion notification |
-| `0x08` | `PKT_FIN_ACK` | `[8B TxID][1B VerifiedStatus]` | End-to-end SHA-256 verification confirmation |
+| `0x06` | `PKT_FEEDBACK` | `[4B HighestContig][4B ScanLimit][4B RecvCnt][8B GradUs][8B QueueUs][2B NackCnt][N*4B Nacks]` | Selective repeat SACK/NACK bitmap + Kalman OWDG telemetry |
+| `0x07` | `PKT_FIN` | *(empty)* | Sender completion notification |
+| `0x08` | `PKT_FIN_ACK` | `[1B VerifiedStatus]` | End-to-end SHA-256 verification confirmation |
+| `0x09` | `PKT_ERROR` | `[1B ErrorCode][2B MsgLen][ErrorMessage]` | Explicit fatal error abort notification |
+| `0x0A` | `PKT_COOKIE_CHALLENGE` | `[16B StatelessHMACCookie]` | Stateless anti-spoofing handshake cookie challenge |
 
 ---
 
@@ -118,22 +121,30 @@ Once decrypted and authenticated via `AES-256-GCM`, the inner plaintext frame be
 * **Go 1.20+** (Zero external library dependencies; uses only the Go standard library).
 
 ### 1. Run Built-In Chaos Self-Test (`selftest` mode)
-OpenFIR includes an integrated Gilbert-Elliott burst-loss chaos simulator that automatically validates **both** a 16 MB mixed-entropy large file transfer and a **200-file nested directory tree** transfer under 8% burst packet loss:
+OpenFIR includes an integrated Gilbert-Elliott burst-loss chaos simulator that automatically validates **three** test suites under 8% burst packet loss:
+1. A 16 MB mixed-entropy large file transfer;
+2. A 200-file nested directory tree (including empty subdirectories) via Zero-RTT Virtual Extent;
+3. Concurrent multi-client transfers to a single server.
 
 ```bash
-go run openfir.go -mode selftest -sim-loss 0.08 -sim-burst 4 -sockets 8
+go run openfir.go -mode selftest
 ```
 
 ### 2. Production Server & Client Usage
 
 #### Build Binary
 ```bash
-go build -o openfir openfir.go
+go build -trimpath -ldflags="-s -w" -o openfir openfir.go
+```
+
+#### Generate a 256-Bit Secret Key
+```bash
+export OPENFIR_SECRET=$(openssl rand -hex 32)
 ```
 
 #### Start Receiver (`server` mode)
 ```bash
-./openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret a37f92c819e4b50d
+./openfir -mode server -listen 0.0.0.0:9900 -out ./downloads -secret "$OPENFIR_SECRET"
 ```
 
 #### Send a Single Large File OR an Entire Directory of Small Files (`client` mode)
@@ -142,13 +153,15 @@ go build -o openfir openfir.go
 ./openfir -mode client \
   -server 203.0.113.10:9900 \
   -file /path/to/large_archive.iso \
-  -sockets 8 -init-mbps 100 -max-mbps 1000 -sim-loss 0
+  -sockets 8 -init-mbps 100 -max-mbps 1000 \
+  -secret "$OPENFIR_SECRET"
 
 # Transfer a directory tree containing thousands of small files (Zero-RTT Virtual Extent)
 ./openfir -mode client \
   -server 203.0.113.10:9900 \
   -file /path/to/project_directory \
-  -sockets 8 -init-mbps 100 -max-mbps 1000 -sim-loss 0
+  -sockets 8 -init-mbps 100 -max-mbps 1000 \
+  -secret "$OPENFIR_SECRET"
 ```
 
 ---
@@ -157,23 +170,27 @@ go build -o openfir openfir.go
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `-mode` | `selftest` | Execution mode: `selftest`, `server`, or `client` |
+| `-mode` | `""` | Execution mode: `server`, `client`, or `selftest` |
 | `-listen` | `0.0.0.0:9900` | UDP listen address for `server` mode |
 | `-out` | `./openfir_downloads` | Output directory for received files/directories in `server` mode |
 | `-server` | `127.0.0.1:9900` | Target server UDP address for `client` mode |
 | `-file` | `""` | Path to the file OR directory to transmit in `client` mode |
+| `-secret` | `""` | Shared secret: 64-char hex (256-bit) or `pass:<passphrase>` (or via `OPENFIR_SECRET`) |
 | `-sockets` | `8` | Number of concurrent local UDP sockets for multi-path striping |
 | `-init-mbps` | `50.0` | Initial pacing rate in MB/s |
 | `-max-mbps` | `1000.0` | Maximum pacing rate ceiling in MB/s |
-| `-secret` | `a37f92c819e4b50d` | Pre-shared hex secret used to derive the 256-bit AES-GCM key |
-| `-sim-loss` | `0.08` | Simulated Gilbert-Elliott packet loss ratio (`0` disables simulation) |
+| `-overwrite` | `false` | Allow server to overwrite existing destination files |
+| `-max-file-gb` | `64` | Maximum allowed transfer size in GB on server |
+| `-max-sessions` | `64` | Maximum concurrent active transfer sessions on server |
+| `-timeout` | `25` | Session idle/stall timeout in seconds |
+| `-sim-loss` | `0.0` | Simulated packet loss ratio (`0.0` in production; `0.08` auto-applied in `selftest`) |
 | `-sim-burst` | `4` | Simulated contiguous burst drop length |
 
 ---
 
 ## Cryptography & Export Control Notice
 
-This repository utilizes standard `AES-256-GCM` (Authenticated Encryption with Associated Data) and `SHA-256` from the Go standard library (`crypto/aes`, `crypto/cipher`, `crypto/sha256`) for packet confidentiality and authentication. This software is publicly available open-source encryption source code eligible for license exception **TSU / EAR § 742.15(b)** under the U.S. Export Administration Regulations.
+This repository utilizes standard `AES-256-GCM`, `HMAC-SHA256`, and `SHA-256` from the Go standard library (`crypto/aes`, `crypto/cipher`, `crypto/hmac`, `crypto/sha256`) for packet confidentiality and authentication. This software is publicly available open-source encryption source code eligible for license exception **TSU / EAR § 742.15(b)** under the U.S. Export Administration Regulations.
 
 ---
 
