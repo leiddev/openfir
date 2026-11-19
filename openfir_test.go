@@ -94,9 +94,14 @@ func TestWireCryptoDirectionSeparationAndTamper(t *testing.T) {
 		t.Fatalf("valid C2S packet failed to open")
 	}
 
-	// AAD tamper check: mutating sequence number in outer header must fail GCM auth
-	wire[14] ^= 0x01
-	if _, _, ok := eng.Open(wire, DirClientToServer); ok {
-		t.Fatalf("AAD-tampered packet must be rejected")
+	// AAD tamper check: every byte of the outer header is authenticated, so
+	// mutating any of them must fail. Note that the masked sequence number is
+	// wire[6:14] and wire[14:18] is the salt (which is also part of the nonce).
+	for off := 0; off < OuterHeaderSize; off++ {
+		tampered := append([]byte(nil), wire...)
+		tampered[off] ^= 0x01
+		if _, _, ok := eng.Open(tampered, DirClientToServer); ok {
+			t.Fatalf("AAD-tampered packet must be rejected (byte %d)", off)
+		}
 	}
 }

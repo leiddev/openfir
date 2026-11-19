@@ -22,6 +22,9 @@ jobs:
         with:
           go-version: "1.22"
 
+      - name: Run Unit Tests
+        run: go test ./... -count=1
+
       - name: Run Automated Chaos Self-Test
         run: go run openfir.go -mode selftest
 
